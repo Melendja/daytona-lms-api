@@ -5,6 +5,21 @@ const sql     = require("mssql");
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
+const crypto        = require("crypto");
+
+/* In-memory reset token store: token -> { userId, email, expires } */
+const resetTokens   = new Map();
+
+/* Nodemailer transporter — configure via Render environment variables:
+   EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS, EMAIL_FROM          */
+const nodemailer     = require("nodemailer");
+const emailTransport = nodemailer.createTransport({
+  host:   process.env.EMAIL_HOST || "smtp.gmail.com",
+  port:   parseInt(process.env.EMAIL_PORT || "587"),
+  secure: false,
+  auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
+});
+
 
 /* ── CORS ────────────────────────────────────────────────────── */
 app.use(cors({
@@ -534,46 +549,34 @@ app.delete("/api/materials/:id", async (req, res) => {
   }
 });
 
+
 /* ════════════════════════════════════════════════════════════════
-   AUTH ROUTES
+   AUTH ROUTES  –  Login · Forgot Password · Reset Password
 ════════════════════════════════════════════════════════════════ */
 
 /* POST /api/login */
 app.post("/api/login", async (req, res) => {
   const { email, password } = req.body;
-
   if (!email || !password)
     return res.status(400).json({ error: "Email and password are required." });
-
   try {
     const bcrypt = require("bcrypt");
     const p = await getPool();
-
-    // Look up user by email — dbo.User is read-only, no modifications made
     const result = await p.request()
-      .input("email", sql.NVarChar, email)
+      .input("email", sql.NVarChar, email.trim())
       .query(`
         SELECT userId, email, passwordHash, role, firstName, lastName, isActive
         FROM   [dbo].[User]
         WHERE  email = @email
       `);
-
     const user = result.recordset[0];
-
-    // User not found → generic 401 (don't reveal which field was wrong)
     if (!user)
       return res.status(401).json({ error: "Invalid email or password." });
-
-    // Account disabled check
     if (!user.isActive)
       return res.status(403).json({ error: "This account is disabled. Contact your instructor." });
-
-    // Verify password against stored bcrypt hash
     const match = await bcrypt.compare(password, user.passwordHash);
     if (!match)
       return res.status(401).json({ error: "Invalid email or password." });
-
-    // Success — return claims (passwordHash is never sent to the client)
     res.json({
       userId:    user.userId,
       email:     user.email,
@@ -582,10 +585,131 @@ app.post("/api/login", async (req, res) => {
       role:      user.role,
       isActive:  user.isActive
     });
-
   } catch (err) {
     console.error("POST /api/login:", err.message);
     res.status(500).json({ error: "Server error. Please try again." });
+  }
+});
+
+/* POST /api/forgot-password
+   Accepts : { email }
+   Action  : Generates a secure token, stores it in-memory for 1 hour,
+             and emails a reset link to the user's .edu address.
+   Response: Always 200 — never reveals whether the email exists. */
+app.post("/api/forgot-password", async (req, res) => {
+  const { email } = req.body;
+  if (!email)
+    return res.status(400).json({ error: "Email is required." });
+
+  try {
+    const p = await getPool();
+    const result = await p.request()
+      .input("email", sql.NVarChar, email.trim().toLowerCase())
+      .query(`
+        SELECT userId, email, firstName, isActive
+        FROM   [dbo].[User]
+        WHERE  LOWER(email) = @email
+      `);
+
+    const user = result.recordset[0];
+
+    // Return success regardless — prevents user enumeration
+    if (!user || !user.isActive) {
+      return res.json({ message: "If that email exists, a reset link has been sent." });
+    }
+
+    // Invalidate any existing token for this user
+    for (const [t, data] of resetTokens.entries()) {
+      if (data.userId === user.userId) resetTokens.delete(t);
+    }
+
+    // Generate a cryptographically secure 64-char hex token
+    const token   = crypto.randomBytes(32).toString("hex");
+    const expires = Date.now() + 60 * 60 * 1000; // 1 hour
+    resetTokens.set(token, { userId: user.userId, email: user.email, expires });
+
+    const resetUrl = `https://melendja.github.io/WebII_CoursesDemo/login.html?token=${token}`;
+
+    await emailTransport.sendMail({
+      from:    `"${process.env.EMAIL_FROM || "Web Systems II LMS"}" <${process.env.EMAIL_USER}>`,
+      to:      user.email,
+      subject: "Web Systems II \u2014 Password Reset Request",
+      html: `
+        <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto">
+          <div style="background:#1a2d4a;padding:20px 24px;border-bottom:3px solid #e8a020">
+            <h2 style="color:#fff;margin:0;font-size:18px">Web Systems II LMS</h2>
+            <p style="color:#a8bcce;margin:4px 0 0;font-size:12px">521F_SP26_ON &nbsp;&middot;&nbsp; Daytona State College</p>
+          </div>
+          <div style="padding:24px;background:#fff;border:1px solid #e5e7eb">
+            <p>Hi <strong>${user.firstName}</strong>,</p>
+            <p style="color:#374151">
+              A password reset was requested for your LMS account.
+              Click below to set a new password. This link expires in <strong>1 hour</strong>.
+            </p>
+            <a href="${resetUrl}"
+               style="display:inline-block;background:#1a2d4a;color:#fff;
+                      padding:12px 28px;border-radius:6px;text-decoration:none;
+                      font-weight:bold;font-size:14px">
+              Reset My Password &rarr;
+            </a>
+            <p style="margin-top:20px;font-size:12px;color:#6b7280">
+              If you did not request this, ignore this email &mdash; your password will not change.<br>
+              Expires: ${new Date(expires).toLocaleString("en-US", { timeZone: "America/New_York" })} ET
+            </p>
+          </div>
+        </div>
+      `
+    });
+
+    console.log(`Password reset email sent to ${user.email}`);
+    res.json({ message: "If that email exists, a reset link has been sent." });
+
+  } catch (err) {
+    console.error("POST /api/forgot-password:", err.message);
+    res.status(500).json({ error: "Failed to send reset email. Please try again." });
+  }
+});
+
+/* POST /api/reset-password
+   Accepts : { token, newPassword }
+   Action  : Verifies the token, bcrypt-hashes the new password,
+             and writes it to dbo.User.passwordHash.
+   The User table schema is NOT changed — only the hash value is updated. */
+app.post("/api/reset-password", async (req, res) => {
+  const { token, newPassword } = req.body;
+
+  if (!token || !newPassword)
+    return res.status(400).json({ error: "Token and new password are required." });
+
+  if (newPassword.length < 8)
+    return res.status(400).json({ error: "Password must be at least 8 characters." });
+
+  const entry = resetTokens.get(token);
+  if (!entry)
+    return res.status(400).json({ error: "Invalid or expired reset link. Please request a new one." });
+
+  if (Date.now() > entry.expires) {
+    resetTokens.delete(token);
+    return res.status(400).json({ error: "This reset link has expired. Please request a new one." });
+  }
+
+  try {
+    const bcrypt  = require("bcrypt");
+    const newHash = await bcrypt.hash(newPassword, 12);
+
+    const p = await getPool();
+    await p.request()
+      .input("hash",   sql.NVarChar, newHash)
+      .input("userId", sql.Int,      entry.userId)
+      .query("UPDATE [dbo].[User] SET passwordHash = @hash WHERE userId = @userId");
+
+    resetTokens.delete(token); // single-use — invalidate immediately
+    console.log(`Password reset successful for userId ${entry.userId}`);
+    res.json({ message: "Password updated successfully. You can now log in." });
+
+  } catch (err) {
+    console.error("POST /api/reset-password:", err.message);
+    res.status(500).json({ error: "Failed to update password. Please try again." });
   }
 });
 
@@ -617,10 +741,12 @@ async function hashPw(plain) {
 app.listen(PORT, () => {
   console.log(`\n🚀 Daytona LMS API → http://localhost:${PORT}`);
   console.log(`   Health    : http://localhost:${PORT}/api/health`);
-  console.log(`   Login     : http://localhost:${PORT}/api/login`);
   console.log(`   Users     : http://localhost:${PORT}/api/users`);
   console.log(`   Courses   : http://localhost:${PORT}/api/courses`);
   console.log(`   Lessons   : http://localhost:${PORT}/api/courses/:id/lessons`);
   console.log(`   Materials : http://localhost:${PORT}/api/courses/:id/materials\n`);
+  console.log(`   Login     : http://localhost:${PORT}/api/login`);
+  console.log(`   Forgot Pw : http://localhost:${PORT}/api/forgot-password`);
+  console.log(`   Reset Pw  : http://localhost:${PORT}/api/reset-password`);
   getPool().catch(err => console.error("❌ DB connection failed:", err.message));
 });
