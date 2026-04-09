@@ -24,9 +24,11 @@ const emailTransport = nodemailer.createTransport({
 /* ── CORS ────────────────────────────────────────────────────── */
 app.use(cors({
   origin: "*",
-  methods: ["GET","POST","PUT","DELETE","OPTIONS"],
-  allowedHeaders: ["Content-Type", "ngrok-skip-browser-warning"]
+  methods: ["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "ngrok-skip-browser-warning"]
 }));
+// Explicitly handle OPTIONS preflight for all routes
+app.options("*", cors());
 app.use(express.json());
 
 /* ── SQL Server config (Azure SQL) ───────────────────────────── */
