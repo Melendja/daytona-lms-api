@@ -16,7 +16,7 @@ const nodemailer     = require("nodemailer");
 const emailTransport = nodemailer.createTransport({
   host:   process.env.EMAIL_HOST || "smtp.gmail.com",
   port:   parseInt(process.env.EMAIL_PORT || "587"),
-  secure: false,
+  secure: true,   // port 465 + SSL — required on Render free tier (port 587 is blocked)
   auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
 });
 
