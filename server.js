@@ -716,6 +716,42 @@ app.post("/api/reset-password", async (req, res) => {
 /* ════════════════════════════════════════════════════════════════
    HEALTH CHECK
 ════════════════════════════════════════════════════════════════ */
+/* PATCH /api/users/:id/password
+   Admin-only: sets a new bcrypt-hashed password for any user in dbo.User.
+   Accepts: { password }  — plain text, hashed server-side before storage.  */
+app.patch("/api/users/:id/password", async (req, res) => {
+  const { password } = req.body;
+  if (!password || password.length < 8)
+    return res.status(400).json({ error: "Password must be at least 8 characters." });
+
+  try {
+    const bcrypt  = require("bcrypt");
+    const newHash = await bcrypt.hash(password, 12);
+    const p       = await getPool();
+
+    const r = await p.request()
+      .input("hash",   sql.NVarChar, newHash)
+      .input("userId", sql.Int,      +req.params.id)
+      .query(`
+        UPDATE [dbo].[User]
+        SET    passwordHash = @hash
+        OUTPUT INSERTED.userId, INSERTED.email, INSERTED.firstName,
+               INSERTED.lastName, INSERTED.role
+        WHERE  userId = @userId
+      `);
+
+    if (!r.recordset.length)
+      return res.status(404).json({ error: "User not found." });
+
+    console.log(`Password updated for userId ${req.params.id}`);
+    res.json({ success: true, user: r.recordset[0] });
+
+  } catch (err) {
+    console.error("PATCH /api/users/:id/password:", err.message);
+    res.status(500).json({ error: "Failed to update password. Please try again." });
+  }
+});
+
 app.get("/api/health", async (req, res) => {
   try {
     const p = await getPool();
@@ -746,7 +782,6 @@ app.listen(PORT, () => {
   console.log(`   Lessons   : http://localhost:${PORT}/api/courses/:id/lessons`);
   console.log(`   Materials : http://localhost:${PORT}/api/courses/:id/materials\n`);
   console.log(`   Login     : http://localhost:${PORT}/api/login`);
-  console.log(`   Forgot Pw : http://localhost:${PORT}/api/forgot-password`);
-  console.log(`   Reset Pw  : http://localhost:${PORT}/api/reset-password`);
+  console.log(`   Set PW    : http://localhost:${PORT}/api/users/:id/password`);
   getPool().catch(err => console.error("❌ DB connection failed:", err.message));
 });
