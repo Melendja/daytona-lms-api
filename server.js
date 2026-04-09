@@ -535,6 +535,61 @@ app.delete("/api/materials/:id", async (req, res) => {
 });
 
 /* ════════════════════════════════════════════════════════════════
+   AUTH ROUTES
+════════════════════════════════════════════════════════════════ */
+
+/* POST /api/login */
+app.post("/api/login", async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password)
+    return res.status(400).json({ error: "Email and password are required." });
+
+  try {
+    const bcrypt = require("bcrypt");
+    const p = await getPool();
+
+    // Look up user by email — dbo.User is read-only, no modifications made
+    const result = await p.request()
+      .input("email", sql.NVarChar, email)
+      .query(`
+        SELECT userId, email, passwordHash, role, firstName, lastName, isActive
+        FROM   [dbo].[User]
+        WHERE  email = @email
+      `);
+
+    const user = result.recordset[0];
+
+    // User not found → generic 401 (don't reveal which field was wrong)
+    if (!user)
+      return res.status(401).json({ error: "Invalid email or password." });
+
+    // Account disabled check
+    if (!user.isActive)
+      return res.status(403).json({ error: "This account is disabled. Contact your instructor." });
+
+    // Verify password against stored bcrypt hash
+    const match = await bcrypt.compare(password, user.passwordHash);
+    if (!match)
+      return res.status(401).json({ error: "Invalid email or password." });
+
+    // Success — return claims (passwordHash is never sent to the client)
+    res.json({
+      userId:    user.userId,
+      email:     user.email,
+      firstName: user.firstName,
+      lastName:  user.lastName,
+      role:      user.role,
+      isActive:  user.isActive
+    });
+
+  } catch (err) {
+    console.error("POST /api/login:", err.message);
+    res.status(500).json({ error: "Server error. Please try again." });
+  }
+});
+
+/* ════════════════════════════════════════════════════════════════
    HEALTH CHECK
 ════════════════════════════════════════════════════════════════ */
 app.get("/api/health", async (req, res) => {
@@ -562,6 +617,7 @@ async function hashPw(plain) {
 app.listen(PORT, () => {
   console.log(`\n🚀 Daytona LMS API → http://localhost:${PORT}`);
   console.log(`   Health    : http://localhost:${PORT}/api/health`);
+  console.log(`   Login     : http://localhost:${PORT}/api/login`);
   console.log(`   Users     : http://localhost:${PORT}/api/users`);
   console.log(`   Courses   : http://localhost:${PORT}/api/courses`);
   console.log(`   Lessons   : http://localhost:${PORT}/api/courses/:id/lessons`);
